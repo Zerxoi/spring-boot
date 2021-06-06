@@ -232,3 +232,367 @@ WelcomePageHandlerMapping(TemplateAvailabilityProviders templateAvailabilityProv
 }
 ```
 
+# 3 请求处理
+
+- Rest风格支持（使用HTTP请求方式动词来表示对资源的操作）
+    - 获取用户： `GET /user`
+    - 创建用户： `POST /user`
+    - 修改用户： `PUT /user`
+    - 删除用户： `DELETE /user`
+- 核心Filter：`HiddenHttpMethodFilter`
+- 使用方法：
+    - 表单 `method=post`
+    - 隐藏域 `_method=PUT/PATCH/DELETE`
+- SpringBoot中手动开启
+    - 因为不是所有场景都需要开启
+    - 将 spring.mvc.hiddenmethod.filter.enabled 属性配置为 true 即可开启
+- `@XxxRequestMapping(value = "/user")` 替代 `@RequestMapping(value = "/user", method = RequestMethod.XXX)`
+
+REST 原理
+
+1. HTML 表单使用 REST
+
+因为 HTML 表单只支持 GET，POST 请求，所以如果想发送 REST 请求需要创建 `HiddenHttpMethodFilter` 过滤器
+
+`HiddenHttpMethodFilter` 的创建条件是容器中没有其他 `HiddenHttpMethodFilter` 组件并且 `spring.mvc.hiddenmethod.filter.enabled` 属性开启。
+
+```java
+@Bean
+@ConditionalOnMissingBean(HiddenHttpMethodFilter.class)
+@ConditionalOnProperty(prefix = "spring.mvc.hiddenmethod.filter", name = "enabled")
+public OrderedHiddenHttpMethodFilter hiddenHttpMethodFilter() {
+    return new OrderedHiddenHttpMethodFilter();
+}
+```
+
+`HiddenHttpMethodFilter` 的使用条件是请求方法是 `POST` ，请求没有出现异常并且请求的 `_method` 参数值为 `PUT`，`PATCH` 或者 `DELETE` 其中之一。
+
+```java
+protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain filterChain) throws ServletException, IOException {
+    HttpServletRequest requestToUse = request;
+    if ("POST".equals(request.getMethod()) && request.getAttribute("javax.servlet.error.exception") == null) {
+        String paramValue = request.getParameter(this.methodParam);
+        if (StringUtils.hasLength(paramValue)) {
+            String method = paramValue.toUpperCase(Locale.ENGLISH);
+            if (ALLOWED_METHODS.contains(method)) {
+                requestToUse = new HiddenHttpMethodFilter.HttpMethodRequestWrapper(request, method);
+            }
+        }
+    }
+
+    filterChain.doFilter((ServletRequest)requestToUse, response);
+}
+```
+
+表单请求会被 `HiddenHttpMethodFilter` 拦截，如果请求方法是 `POST` 并且 `_method` 参数值是 `PUT`，`DELETE`，`PATCH` 其中之一，原生 HTML 请求会被包装成 `RequestWrapper`。包装后的 `RequestWrapper` 的 `getMethod` 方法返回的 `_method` 参数设定的方法。过滤器放行的后续的请求使用的是包装后的 `RequestWrapper`。
+
+> **Tip**：将默认参数 `_method` 名替换成指定参数名
+> 通过自定义一个 `HiddenHttpMethodFilter` 组件，修改组件的 `methodParam` 属性就会在过滤逻辑使用对应的参数。
+>
+> ```java
+> @Bean
+> public HiddenHttpMethodFilter hiddenHttpMethodFilter(){
+>     HiddenHttpMethodFilter methodFilter = new HiddenHttpMethodFilter();
+>     methodFilter.setMethodParam("_m");
+>     return methodFilter;
+> }
+> ```
+
+
+
+
+2. 使用客户端工具发送 REST 请求
+
+直接发送 `PUT`, `PATCH`, `DELETE` 方法即可，无需 `Filter`。
+
+
+# 4 请求映射的原理
+
+`DispatcherServlet` 是所有请求的入口，其依赖关系如下。
+
+```
+GenericServlet (javax.servlet)
+    HttpServlet (javax.servlet.http)    [doGet/doPost/...]
+        HttpServletBean (org.springframework.web.servlet)
+            FrameworkServlet (org.springframework.web.servlet)    [processRequest]
+                DispatcherServlet (org.springframework.web.servlet)   [doService -> doDispatch]
+```
+
+
+
+`HttpServlet` 的 `doGet` / `doPost` 等方法在 `FrameworkServlet` 中被重写并调用 `FrameworkServlet` 的 `processRequest` 方法来处理请求。
+
+```java
+@Override
+protected final void doGet(HttpServletRequest request, HttpServletResponse response)
+        throws ServletException, IOException {
+
+    processRequest(request, response);
+}
+```
+
+`FrameworkServlet` 的 `processRequest` 又会调用 `DispatcherServlet` 的 `doService` 来处理请求
+
+```java
+protected final void processRequest(HttpServletRequest request, HttpServletResponse response)
+    // ...
+    try {
+        doService(request, response);
+    }
+    // ...
+}
+```
+
+`DispatcherServlet` 的 `doService` 方法又会调用 `DispatcherServlet` 的 `doDispatch` 方法
+
+```java
+@Override
+protected void doService(HttpServletRequest request, HttpServletResponse response) throws Exception {
+    logRequest(request);
+    // ...
+    try {
+        doDispatch(request, response);
+    }
+    // ...
+}
+```
+
+`DispacherServlet` 的 `doDispatch` 方法是请求映射的重点，每个请求都会执行该方法。
+
+```java
+protected void doDispatch(HttpServletRequest request, HttpServletResponse response) throws Exception {
+    // ...
+    // 找到当前请求使用哪个处理器进行处理
+    mappedHandler = getHandler(processedRequest);
+    if (mappedHandler == null) {
+        noHandlerFound(processedRequest, response);
+        return;
+    }
+
+    // Determine handler adapter for the current request.
+    HandlerAdapter ha = getHandlerAdapter(mappedHandler.getHandler());
+    // ...
+}
+```
+
+DispatcherServlet 遍历容器中注册的所有处理器映射中寻找能够处理请求的处理器映射并返回。
+
+```java
+@Nullable
+protected HandlerExecutionChain getHandler(HttpServletRequest request) throws Exception {
+    if (this.handlerMappings != null) {
+        for (HandlerMapping mapping : this.handlerMappings) {
+            HandlerExecutionChain handler = mapping.getHandler(request);
+            if (handler != null) {
+                return handler;
+            }
+        }
+    }
+    return null;
+}
+```
+
+Spring Boot 自动配置一些 `HandlerMapping`:
+
+![处理器映射列表](imgs/处理器映射列表.png)
+
+1. `RequestMappingHandlerMapping`：保存了所有 `@RequestMapping` 和 `Handler` 的映射规则
+
+```java
+@Bean
+@Primary
+@Override
+public RequestMappingHandlerMapping requestMappingHandlerMapping(
+        @Qualifier("mvcContentNegotiationManager") ContentNegotiationManager contentNegotiationManager,
+        @Qualifier("mvcConversionService") FormattingConversionService conversionService,
+        @Qualifier("mvcResourceUrlProvider") ResourceUrlProvider resourceUrlProvider) {
+    // Must be @Primary for MvcUriComponentsBuilder to work
+    return super.requestMappingHandlerMapping(contentNegotiationManager, conversionService,
+            resourceUrlProvider);
+}
+```
+
+![请求映射信息注册](imgs/请求映射信息注册.png)
+
+2. `WelcomePageHandlerMapping`：访问 `/` 能访问到 `index.html`。
+
+```java
+@Bean
+public WelcomePageHandlerMapping welcomePageHandlerMapping(ApplicationContext applicationContext,
+        FormattingConversionService mvcConversionService, ResourceUrlProvider mvcResourceUrlProvider) {
+    WelcomePageHandlerMapping welcomePageHandlerMapping = new WelcomePageHandlerMapping(
+            new TemplateAvailabilityProviders(applicationContext), applicationContext, getWelcomePage(),
+            this.mvcProperties.getStaticPathPattern());
+    welcomePageHandlerMapping.setInterceptors(getInterceptors(mvcConversionService, mvcResourceUrlProvider));
+    welcomePageHandlerMapping.setCorsConfigurations(getCorsConfigurations());
+    return welcomePageHandlerMapping;
+}
+
+WelcomePageHandlerMapping(TemplateAvailabilityProviders templateAvailabilityProviders,
+        ApplicationContext applicationContext, Resource welcomePage, String staticPathPattern) {
+    if (welcomePage != null && "/**".equals(staticPathPattern)) {
+        logger.info("Adding welcome page: " + welcomePage);
+        setRootViewName("forward:index.html");
+    }
+    else if (welcomeTemplateExists(templateAvailabilityProviders, applicationContext)) {
+        logger.info("Adding welcome page template: index");
+        setRootViewName("index");
+    }
+}
+```
+3. BeanNameUrlHandlerMapping
+4. RouterFunctionMapping
+5. SimpleUrlHandlerMapping
+
+# 5 请求参数
+
+## 5.1 普通参数与基本注解
+
+注解：
+
+`@PathVariable`：路径变量
+`@RequestHeader`：请求头
+`@RequestParam`：请求参数
+`@RequestBody`：请求体
+`@CookieValue`：Cookie值
+
+
+
+`@RequestAttribute`：请求域属性
+
+```java
+@Controller
+public class RequestAttributeController {
+    @RequestMapping("/forward")
+    public String forward(HttpServletRequest request) {
+        request.setAttribute("msg", "成功");
+        request.setAttribute("code", 200);
+        return "forward:/success";
+    }
+
+    @ResponseBody
+    @RequestMapping("/success")
+    public Map<String, Object> success(@RequestAttribute("msg") String msg, @RequestAttribute("code") Integer code, HttpServletRequest request) {
+        Object msg1 = request.getAttribute("msg");
+        Map<String, Object> map = new HashMap<>();
+        map.put("msg", msg);
+        map.put("msg1", msg1);
+        map.put("code", code);
+        return map;
+    }
+}
+```
+
+`@MatrixVariable`：
+
+Spring Boot 中默认禁用了矩阵变量功能，在 WebMvcAutoConfiguration 中会使用 UrlPathHelper 来配置路径匹配。
+
+```java
+@Override
+public void configurePathMatch(PathMatchConfigurer configurer) {
+    if (this.mvcProperties.getPathmatch()
+            .getMatchingStrategy() == WebMvcProperties.MatchingStrategy.PATH_PATTERN_PARSER) {
+        configurer.setPatternParser(new PathPatternParser());
+    }
+    configurer.setUseSuffixPatternMatch(this.mvcProperties.getPathmatch().isUseSuffixPattern());
+    configurer.setUseRegisteredSuffixPatternMatch(
+            this.mvcProperties.getPathmatch().isUseRegisteredSuffixPattern());
+    this.dispatcherServletPath.ifAvailable((dispatcherPath) -> {
+        String servletUrlMapping = dispatcherPath.getServletUrlMapping();
+        if (servletUrlMapping.equals("/") && singleDispatcherServlet()) {
+            UrlPathHelper urlPathHelper = new UrlPathHelper();
+            urlPathHelper.setAlwaysUseFullPath(true);
+            configurer.setUrlPathHelper(urlPathHelper);
+        }
+    });
+}
+```
+
+UrlPathHelper 是用于 URL 路径匹配的 Helper 类。在 RequestDispatcher 中提供对 URL 路径的支持，并支持一致的 URL 解码。
+
+UrlPathHelper 包含一个 removeSemicolonContent 属性，该属性默认值为 true，会将 `;` 内容从请求 URI 中删除，所以默认情况下矩阵变量功能不生效。
+
+使用自定义的 UrlPathHelper
+
+1. @Bean
+
+```java
+@Configuration
+public class WebConfiguration {
+    @Bean
+    public WebMvcConfigurer webMvcConfigurer() {
+        return new WebMvcConfigurer() {
+            @Override
+            public void configurePathMatch(PathMatchConfigurer configurer) {
+                UrlPathHelper urlPathHelper = new UrlPathHelper();
+                urlPathHelper.setRemoveSemicolonContent(false);
+                configurer.setUrlPathHelper(urlPathHelper);
+            }
+        };
+    }
+}
+```
+
+2. @Configuration + 实现 WebMvcConfigurer
+
+```java
+@Configuration
+public class WebConfiguration implements WebMvcConfigurer {
+    @Override
+    public void configurePathMatch(PathMatchConfigurer configurer) {
+        UrlPathHelper urlPathHelper = new UrlPathHelper();
+        urlPathHelper.setRemoveSemicolonContent(false);
+        configurer.setUrlPathHelper(urlPathHelper);
+    }
+}
+```
+
+测试
+
+矩阵变量要想生效必须有 `URL` 路径变量，如果多个路径变量有相同的矩阵变量，要通过 `pathVar` 指定对应的路径变量。
+
+```java
+// localhost:8080/cars/sell;low=200000;brand=audi,benz,bwm
+// {"low":200000,"sell":"sell","brand":["audi","benz","bwm"]}
+@GetMapping("/cars/{sell}")
+public Map<String, Object> carsSell(@MatrixVariable("low") Integer low, @MatrixVariable("brand") List<String> brand,
+        @PathVariable("sell") String sell) {
+    Map<String, Object> map = new HashMap<>();
+    map.put("low", low);
+    map.put("brand", brand);
+    map.put("sell", sell);
+    return map;
+}
+
+// localhost:8080/boss/1;age=45/emp/6;age=24
+// {"bossAge":45,"empAge":24}
+@RequestMapping("/boss/{bossId}/emp/{empId}")
+public Map<String, Object> bossEmp(@MatrixVariable(value = "age", pathVar = "bossId") Integer bossAge,
+        @MatrixVariable(value = "age", pathVar = "empId") Integer empAge) {
+    Map<String, Object> map = new HashMap<>();
+    map.put("bossAge", bossAge);
+    map.put("empAge", empAge);
+    return map;
+}
+```
+
+`@ModelAttribute`：
+
+Servlet API：
+
+`WebRequest`、`ServletRequest`、`MultipartRequest`、`HttpSession`、`javax.servlet.http.PushBuilder`、`Principal`、`InputStream`、`Reader`、`HttpMethod`、`Locale`、`TimeZone`、`ZoneId`
+
+复杂数据：
+
+`Map`、`Model`（map、model里面的数据会被放在request的请求域  request.setAttribute）、`Errors`/`BindingResult`、`RedirectAttributes`（ 重定向携带数据）、`ServletResponse`（response）、`SessionStatus`、`UriComponentsBuilder`、`ServletUriComponentsBuilder`。
+
+## 5.2 参数处理原理
+
+- HandlerMapping中找到能处理请求的Handler（Controller.method()）
+- 为当前Handler 找一个适配器 HandlerAdapter； RequestMappingHandlerAdapter
+- 适配器执行目标方法并确定方法参数的每一个值
+
+![处理器适配器列表](imgs/处理器适配器列表.png)
+
+- RequestMappingHandlerAdapter 支持标注 @RequestMapping 的处理器
+- HandlerFunctionAdapter 支持函数式编程
