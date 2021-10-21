@@ -592,7 +592,188 @@ Servlet API：
 - 为当前Handler 找一个适配器 HandlerAdapter； RequestMappingHandlerAdapter
 - 适配器执行目标方法并确定方法参数的每一个值
 
+1. HandleAdapter
+
 ![处理器适配器列表](imgs/处理器适配器列表.png)
 
 - RequestMappingHandlerAdapter 支持标注 @RequestMapping 的处理器
 - HandlerFunctionAdapter 支持函数式编程
+
+2. 执行目标方法
+
+```java
+protected void doDispatch(HttpServletRequest request, HttpServletResponse response) throws Exception {
+    // ...
+    // Determine handler adapter for the current request.
+    HandlerAdapter ha = getHandlerAdapter(mappedHandler.getHandler());
+
+    // Process last-modified header, if supported by the handler.
+    String method = request.getMethod();
+    boolean isGet = HttpMethod.GET.matches(method);
+    if (isGet || HttpMethod.HEAD.matches(method)) {
+        long lastModified = ha.getLastModified(request, mappedHandler.getHandler());
+        if (new ServletWebRequest(request, response).checkNotModified(lastModified) && isGet) {
+            return;
+        }
+    }
+
+    if (!mappedHandler.applyPreHandle(processedRequest, response)) {
+        return;
+    }
+
+    // Actually invoke the handler.
+    mv = ha.handle(processedRequest, response, mappedHandler.getHandler());
+
+    // ...
+}
+```
+
+在获取到处理器适配器之后，处理器适配器会通过  `mv = ha.handle(processedRequest, response, mappedHandler.getHandler());` 调用处理器方法
+
+先调用 AbstractHandlerMethodAdapter 的 handle
+
+```java
+@Override
+@Nullable
+public final ModelAndView handle(HttpServletRequest request, HttpServletResponse response, Object handler)
+        throws Exception {
+
+    return handleInternal(request, response, (HandlerMethod) handler);
+}
+```
+
+再调用 RequestMappingHandlerAdapter 的 handleInternal 方法
+
+```java
+@Override
+protected ModelAndView handleInternal(HttpServletRequest request,
+        HttpServletResponse response, HandlerMethod handlerMethod) throws Exception {
+
+    ModelAndView mav;
+    checkRequest(request);
+
+    // Execute invokeHandlerMethod in synchronized block if required.
+    if (this.synchronizeOnSession) {
+        HttpSession session = request.getSession(false);
+        if (session != null) {
+            Object mutex = WebUtils.getSessionMutex(session);
+            synchronized (mutex) {
+                mav = invokeHandlerMethod(request, response, handlerMethod);
+            }
+        }
+        else {
+            // No HttpSession available -> no mutex necessary
+            mav = invokeHandlerMethod(request, response, handlerMethod);
+        }
+    }
+    else {
+        // No synchronization on session demanded at all...
+        mav = invokeHandlerMethod(request, response, handlerMethod);
+    }
+
+    if (!response.containsHeader(HEADER_CACHE_CONTROL)) {
+        if (getSessionAttributesHandler(handlerMethod).hasSessionAttributes()) {
+            applyCacheSeconds(response, this.cacheSecondsForSessionAttributeHandlers);
+        }
+        else {
+            prepareResponse(response);
+        }
+    }
+
+    return mav;
+}
+```
+
+其中主要通过 invokeHandlerMethod 来执行目标方法
+
+```java
+@Nullable
+protected ModelAndView invokeHandlerMethod(HttpServletRequest request,
+        HttpServletResponse response, HandlerMethod handlerMethod) throws Exception {
+
+    ServletWebRequest webRequest = new ServletWebRequest(request, response);
+    try {
+        WebDataBinderFactory binderFactory = getDataBinderFactory(handlerMethod);
+        ModelFactory modelFactory = getModelFactory(handlerMethod, binderFactory);
+
+        ServletInvocableHandlerMethod invocableMethod = createInvocableHandlerMethod(handlerMethod);
+        if (this.argumentResolvers != null) {
+            invocableMethod.setHandlerMethodArgumentResolvers(this.argumentResolvers);
+        }
+        if (this.returnValueHandlers != null) {
+            invocableMethod.setHandlerMethodReturnValueHandlers(this.returnValueHandlers);
+        }
+        invocableMethod.setDataBinderFactory(binderFactory);
+        invocableMethod.setParameterNameDiscoverer(this.parameterNameDiscoverer);
+
+        ModelAndViewContainer mavContainer = new ModelAndViewContainer();
+        mavContainer.addAllAttributes(RequestContextUtils.getInputFlashMap(request));
+        modelFactory.initModel(webRequest, mavContainer, invocableMethod);
+        mavContainer.setIgnoreDefaultModelOnRedirect(this.ignoreDefaultModelOnRedirect);
+
+        AsyncWebRequest asyncWebRequest = WebAsyncUtils.createAsyncWebRequest(request, response);
+        asyncWebRequest.setTimeout(this.asyncRequestTimeout);
+
+        WebAsyncManager asyncManager = WebAsyncUtils.getAsyncManager(request);
+        asyncManager.setTaskExecutor(this.taskExecutor);
+        asyncManager.setAsyncWebRequest(asyncWebRequest);
+        asyncManager.registerCallableInterceptors(this.callableInterceptors);
+        asyncManager.registerDeferredResultInterceptors(this.deferredResultInterceptors);
+
+        if (asyncManager.hasConcurrentResult()) {
+            Object result = asyncManager.getConcurrentResult();
+            mavContainer = (ModelAndViewContainer) asyncManager.getConcurrentResultContext()[0];
+            asyncManager.clearConcurrentResult();
+            LogFormatUtils.traceDebug(logger, traceOn -> {
+                String formatted = LogFormatUtils.formatValue(result, !traceOn);
+                return "Resume with async result [" + formatted + "]";
+            });
+            invocableMethod = invocableMethod.wrapConcurrentResult(result);
+        }
+
+        invocableMethod.invokeAndHandle(webRequest, mavContainer);
+        if (asyncManager.isConcurrentHandlingStarted()) {
+            return null;
+        }
+
+        return getModelAndView(mavContainer, modelFactory, webRequest);
+    }
+    finally {
+        webRequest.requestCompleted();
+    }
+}
+```
+
+1. 参数解析器
+
+执行目标方法的一个关键是参数解析器 argumentResolvers，参数解析器列表：
+
+确定将要执行的目标方法的每个参数的值是什么
+
+Spring MVC 目标方法能写多少种参数类型，取决于有多少种参数解析器。
+
+![参数解析器列表](imgs/参数解析器列表.png)
+
+参数解析器接口
+```java
+public interface HandlerMethodArgumentResolver {
+    // 是否支持解析参数
+	boolean supportsParameter(MethodParameter parameter);
+
+	@Nullable
+    // 解析参数
+	Object resolveArgument(MethodParameter parameter, @Nullable ModelAndViewContainer mavContainer,
+			NativeWebRequest webRequest, @Nullable WebDataBinderFactory binderFactory) throws Exception;
+
+}
+```
+
+2. 返回值解析器
+
+执行目标方法的另一个关键是 返回值处理器
+
+![返回值解析器列表](imgs/返回值处理器列表.png)
+
+3. 调用目标方法
+
+invocableMethod.invokeAndHandle(webRequest, mavContainer);
